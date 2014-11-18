@@ -1,5 +1,6 @@
 #include <Base/Common/W32Compat.hh> // sprintf wrn
 #include <VideoSource/VideoSource_OpenNI.hh>
+#include <VideoSource/VideoSource_Kinect.hh>
 #include <VideoSource/VideoSourceCapabilities.hh>
 #include <VideoSource/VideoServer.hh>
 #include <Base/Image/Image.hh>
@@ -9,63 +10,29 @@
 #include <Image/Camera.hh>
 #include <vector>
 #include <string>
-
+#include <cstdlib>
 namespace BIAS {
 
-class VideoSource_OpenNI_Depth : public BIAS::VideoSource_OpenNI
+class FPSOpenNiVideoServer : public BIAS::VideoServer
 {
 public:
-  VideoSource_OpenNI_Depth()
-  {
-    SetDepthCaptureMode(BIAS::VideoSource_Kinect_Base::DepthEuclidean);
-    tmp.Init(width,height,depth_channels,ImageBase::ST_float);
-    tmp.SetColorModel(ImageBase::CM_Depth);
-    InitDepthImage(tmp);
-  }
-  virtual ~VideoSource_OpenNI_Depth() {
-  }
-
-  virtual int GrabSingle(BIAS::Camera<unsigned char>& image) {
-    int result = BIAS::VideoSource_OpenNI::GrabSingleDepth(tmp);
-    /*ImageConvert::ConvertST is inconvenient for our purpose,
-      because it merely casts the float to unsigned char,
-      which is a mistake for values>255
-      BIAS::ImageConvert::ConvertST(tmp,image,BIAS::ImageBase::ST_unsignedchar);*/
-    image.Init(width, height, convert_channels, BIAS::ImageBase::ST_unsignedchar);
-    /* do some dirty float to 2* unsigned char converting
-       the value of the depth_channel is the distance in millimeters,
-       thus it's not a problem to omit the decimal place for our purpose
-       bytes to send per second: 30*640*480*2 ~= 18MB!
-    */
-    /// TODO: consider using only 1 convert channel to use only half the bandwidth
-    for(int x=0;x<width;x++) {
-        for(int y=0;y<height;y++) {
-            int v = tmp.GetValue<int>(tmp,x,y,0);
-            if(v>65535) v = 65535;
-            // two convert channels
-            image.SetValue(image,x,y,0,(unsigned char)v&0xFF);
-            image.SetValue(image,x,y,1,(unsigned char)(v>>8)&0xFF);
-        }
-    }
-    return result;
-  }
-private:
-  // constant values, don't change!
-  enum { width = 640, height = 480, depth_channels = 1, convert_channels = 2};
-  BIAS::Camera<float> tmp;
-};
-
-class FPSVideoServer : public BIAS::VideoServer
-{
-public:
-  FPSVideoServer(int fps)
+  FPSOpenNiVideoServer(int fps)
   : fps_(fps)
   , usecPerFrame_(1000000.0/fps)
   {
   }
 
-  virtual ~FPSVideoServer() {}
-
+  virtual ~FPSOpenNiVideoServer() {}
+  
+  virtual int InitFromExistingSource(BIAS::VideoSource_OpenNI *theSource, int port) {
+    std::cout << "init" << std::endl;
+    openNI = theSource;
+    int res = BIAS::VideoServer::InitFromExistingSource(theSource,port);
+    openNI->InitDepthImage(depth_);
+    depth_send_.Init(640,480,2);
+    return 0;
+  }
+  
   int Process() {
     timer_.Start();
     int res=ProcessOneImage();
@@ -84,37 +51,109 @@ public:
     timer_.Reset();
     return res;
   }
+  int ProcessOneImage()  {
+    int ret = 0;
+    if (! Initialized_) {
+      BIASERR("VideoServer not initialized");
+      return -1;
+    }
+    if (server_.GetConnections()<=0)
+    {
+      return 1;
+    }
+    openNI->GrabSingle(CamImage_);
+    
+    ret = sendImage("BIAS_IMAGE",CamImage_);
+    if(ret==0) {
+      openNI->GrabSingleDepth(depth_);
+      for(int x=0;x<640;x++) {
+	  for(int y=0;y<480;y++) {
+	      int v = (int)(depth_.PixelValue(x,y,0));
+	      if(v>65535) v = 65535;
+	      // two convert channels
+	      depth_send_.SetPixel((unsigned char)v&0xFF,x,y,0);
+	      depth_send_.SetPixel((unsigned char)(v>>8)&0xFF,x,y,1);
+	  }
+      }
+      ret = sendImage("BIAS_IMAGE_DEPTH",depth_send_);
+    }
+    return ret;
+  }
 
   double getFPS() { return fps_; }
   double getRealFPS() { return realFps_; }
   double getUsecPerFrame() { return usecPerFrame_; }
+protected:
+  template <class T>
+  int sendImage(const std::string& msgName, BIAS::Camera<T> img ) {
+    int ret = 0;
+    img.SetUID(BIAS::UUID::GenerateUUID());
+    if (jpeg_ > 0) {
+      BIASERR("LIBJPEG not configured --> no compression available !!!");
+      return -1;
+    } else {
+      if (useUDP_){
+      } else {
+	std::stringstream dataToSend;
+	dataToSend<<img;
+	msgSize_= dataToSend.str().length();
+
+	ret = server_.SendMsg(msgName,(char*)&(dataToSend.str()[0]), msgSize_);
+	if (ret == -1) {
+	  BIASERR("Sending of image data failed");
+	  return ret;
+	}
+      }
+    }
+    return ret;
+  }
 private:
+  BIAS::VideoSource_OpenNI *openNI;
   const double fps_;
   double realFps_;
   const double usecPerFrame_;
   BIAS::TimeMeasure timer_;
+  BIAS::Camera<unsigned char> depth_send_;
+  BIAS::Camera<float> depth_;
 };
 
 }
 
 
 int main(int argc, char**argv) {
-  BIAS::VideoSource_OpenNI_Depth cam;
+  BIAS::VideoSource_Kinect cam;
+  BIAS::Camera<unsigned char> img;
+  cam.OpenDevice();
+  cam.SetVideoModeColor();
+  cam.InitImage(img);
+  cam.PreGrab();
+  cam.GrabSingle(img);
+  cam.PostGrab();
+  cam.CloseDevice();
+  BIAS::ImageIO::ExportLibJPEG("test.jpg",img);
+  /*int port = atoi(argv[1]);
+  BIAS::VideoSource_OpenNI cam;
+  BIAS::FPSOpenNiVideoServer server(30);
+  try {
+  BIAS::Camera<unsigned char> img;
   cam.OpenDevice();
   cam.PreGrab();
-  std::cout << "Init server" << std::endl;
-  // init a video server with 30 FPS, because the kinect camera provides 30 FPS
-  BIAS::FPSVideoServer server(30);
-  std::cout << server.InitFromExistingSource(&cam,44887) << std::endl;
-
-  while(true) {
-    if(server.Process() == 0) {
-      std::cout << "Image sent with " << server.getRealFPS() << " FPS" << std::endl;
-    } else {
-      //std::cout << "No client connected; " << server.getRealFPS() << " FPS" << std::endl;
+  cam.InitImage(img);
+  cam.GrabSingle(img);
+  BIAS::ImageIO::ExportLibJPEG("test.jpg",img);
+  return 0;
+  std::cout << server.InitFromExistingSource(&cam,port) << std::endl;
+    while(true) {
+      if(server.Process() == 0) {
+	std::cout << "Image sent with " << server.getRealFPS() << " FPS" << std::endl;
+      } else {
+	//std::cout << "No client connected; " << server.getRealFPS() << " FPS" << std::endl;
+      }
     }
+  } catch(std::exception& e) {
+    std::cout << e.what() << std::endl;
   }
   cam.CloseDevice();
 
-  return 0;
+  return 0;*/
 }
